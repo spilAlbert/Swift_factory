@@ -1,0 +1,12 @@
+{application, swift_factory,
+    [
+        {description, "Basic connectivity functions for SHP"},
+        {vsn, "0.0.1"},
+        {registered, []},
+        {applications, [
+                kernel,
+                stdlib
+            ]},
+        {modules, [swift_factory]},
+        {env, []}
+    ]}.
