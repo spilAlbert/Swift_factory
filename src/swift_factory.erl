@@ -2,19 +2,35 @@
 -compile(export_all).
 
 
-start_global() ->
-		global:register_name(?MODULE, Pid=spawn(?MODULE,init,[])),
-		Pid.
+start_global(User,Pass) ->
+			global:register_name(?MODULE, Pid=spawn(?MODULE,init,[User,Pass])),
+			Pid ! {self(),gimme_da_token},
+			receive
+	                	{error,Msg} -> {error,Msg};
+	                	{_SUrl,_Auth} -> ok
+			after 5000 ->
+	        	        {error,timeout}
+	                end.
 
+start() ->	{error, "No user and/or password provided"}.
 
-start() -> register(?MODULE, Pid=spawn(?MODULE,init,[])),
-	   Pid ! {self(),gimme_da_token},
-           Pid.
+start(User,Pass) -> 
+		Launched = is_pid(erlang:whereis(swift_factory)),
+		if Launched == true -> 	erlang:unregister(?MODULE),
+				      	register(?MODULE, Pid=spawn(?MODULE,init,[User,Pass]));
+		   Launched == false -> register(?MODULE, Pid=spawn(?MODULE,init,[User,Pass]))
+		end,
+		Pid ! {self(),gimme_da_token},
+	   	receive 
+			{error,Msg} -> {error,Msg};
+			{_SUrl,_Auth} -> ok
+	   	after 5000 ->
+			{error,timeout}
+	   	end.
 
 stop() ->
-	   erlang:whereis(?MODULE) ! shutdown.
-
-
+	   erlang:whereis(?MODULE) ! shutdown,
+	   ok.
 
 get_token() ->
 	Pid =  case erlang:whereis(?MODULE) of 
@@ -24,8 +40,7 @@ get_token() ->
 
 	Pid ! {self(),gimme_da_token},
 	receive 
-		{SUrl,AuthToken} ->
-			{SUrl,AuthToken}
+		{SUrl,AuthToken} -> {SUrl,AuthToken}
 	after 2000 ->
 		{error,timeout}
 	end.
@@ -44,7 +59,46 @@ upload_file(Path,Location) ->
 		{error,timeout}
         end.
 
-		
+make_public(Location) ->
+        Pid =  case erlang:whereis(?MODULE) of
+			undefined -> start();
+                	 SPid -> SPid
+                end,
+	Pid ! {self(),make_public,Location,{"X-Container-Read"," .r:*"}},
+	receive
+		{ok} -> {ok};
+		{error,Message} -> {error,Message}
+	after 2000 ->
+		{error,timeout}
+	end.
+
+change_permissions(Location,ACL) ->
+	Pid = case erlang:whereis(?MODULE) of
+                        undefined -> start();
+                         SPid -> SPid
+              end,
+	Pid ! {self(),change_permissions,Location,ACL},
+	receive
+		{ok} -> {ok};
+		{error,Message} -> {error,Message}
+        after 2000 ->
+                {error,timeout}
+        end.
+
+list_content(Location) ->
+        Pid = case erlang:whereis(?MODULE) of
+                        undefined -> start();
+                         SPid -> SPid
+              end,
+	Pid ! {self(),list_content,Location},
+        receive
+                {ok,Content} -> {ok,Content};
+                {error,Message} -> {error,Message}
+        after 2000 ->
+                {error,timeout}
+        end.
+
+
 
 loop(User,Pass,Token,Url) ->
 	receive 
@@ -52,11 +106,20 @@ loop(User,Pass,Token,Url) ->
 			TokenSize = tuple_size(Token),
 			if TokenSize == 0 ->
 				Headers = [{"X-Storage-User",User},{"X-Storage-Pass",Pass}],
-                        	{ok,{{_,200,_}, ReturnHeaders, _Body}} = httpc:request(get, { "http://files-stg.spilcloud.com/auth/v1.0",Headers},[],[]),
-	                        {value,_AuthToken} = lists:keysearch("x-auth-token",1,ReturnHeaders),
-        	                {value,{_,_SUrl}} = lists:keysearch("x-storage-url",1,ReturnHeaders),
-				Client ! {_SUrl,_AuthToken},
-				loop(User,Pass,_AuthToken,_SUrl);
+                        	case httpc:request(get, { "http://files-stg.spilcloud.com/auth/v1.0",Headers},[],[]) of
+					{ok,{{_,200,_}, ReturnHeaders, _Body}} ->
+			                        {value,AuthToken} = lists:keysearch("x-auth-token",1,ReturnHeaders),
+        			                {value,{_,SUrl}} = lists:keysearch("x-storage-url",1,ReturnHeaders),
+						Client ! {SUrl,AuthToken},
+						loop(User,Pass,AuthToken,SUrl);
+
+					{ok,{{_,401,_},_,_}} ->
+						Client ! {error,"Not Authorized"},
+						loop(User,Pass,Token,Url);
+					_ ->
+						Client ! {error, "Unexpected response from the SHP service"},
+						loop(User,Pass,Token,Url)
+				end;
 
 			true -> 
 				case httpc:request(get,{Url,[Token]},[],[]) of
@@ -78,9 +141,6 @@ loop(User,Pass,Token,Url) ->
 						loop(User,Pass,Token,Url)
 				end
                         end;
-		{Client,whatugot} ->
-			Client ! {Url,Token},
-			loop(User,Pass,Token,Url);
 
 		{Client, uploadfile, Location ,Path} ->
 			%check Token
@@ -95,7 +155,6 @@ loop(User,Pass,Token,Url) ->
 				ContentType = lists:concat(["multipart/form-data; boundary=",Boundary]),
 				Body = format_multipart_formdata(Boundary,[],[{file,Filename,Data}]),
 				Headers = [Token] ++ [{"Content-Length", integer_to_list(length(Body))}],
-				io:format("esto es: " ++ Url++Location++"/"++Filename++"~n"),
 				case  httpc:request(put,{Url++Location++"/"++Filename,Headers,ContentType,Data},[],[]) of
 					{ok,{{_,Code,_},_,_}} when Code == 201 ->
 						Client ! {ok,{Code,Url++Location++"/"++Filename}},
@@ -115,16 +174,46 @@ loop(User,Pass,Token,Url) ->
 				end
 			end,
 			loop(User,Pass,Token,Url);
-	
+
+		{Client,change_permissions, Location, ACL} ->
+                        TokenSize = tuple_size(Token),
+                        if TokenSize == 0 ->
+                                Client ! {error, "no token available"};
+                        true ->
+				Headers = [Token] ++ [ACL],
+				case httpc:request(post,{Url++Location,Headers,[],[]},[],[]) of
+					{ok,{{_,Code,_},_,_}} when Code > 199 , Code < 299 ->
+						Client ! {ok};
+					_ ->
+						Client ! {error, "Could not contact the server"}
+				end
+			end,
+			loop(User,Pass,Token,Url);
+
+		{Client, list_content, Location} ->
+			TokenSize = tuple_size(Token),
+                        if TokenSize == 0 ->
+                                Client ! {error, "no token available"};
+                        true ->
+				case httpc:request(get,{Url++Location,[Token]},[],[]) of
+					{ok,{{_,200,_},_,Response}} -> 	Client ! {ok,string:tokens(Response,"\n")};
+					{ok,{{_,404,_},_,Response}} -> 	Client ! {error,Response};
+					_ ->	Client ! {error,"Could not contact the server"}
+				end
+			end,
+			loop(User,Pass,Token,Url); 
+
+
 		{Client,_} ->
 			Client ! {error,"what?"},
 			loop(User,Pass,Token,Url);
+		
 		shutdown -> exit(shutdown)
 			
 	end.
 
 
-init() ->
+init(User,Pass) ->
 	% Here we should load the configuration from a config file
 	inets:start(),
 	loop(User,Pass,{},"").
